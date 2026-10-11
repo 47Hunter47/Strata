@@ -212,9 +212,9 @@ REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my 
 # closes it and the model answers (#1053 does the same, for the reasoning side only).
 # Opt-in, like #1053: "literal_think_guard": true in the model's strata-<model>.json, or STRATA_LITERAL_THINK_GUARD=1.
 # Capped per reply so a model that keeps doing it cannot loop.
-# The end ITSELF is always reported - one log line, totals.ended_inside_thinking (/metrics) and
-# "ended_inside_thinking": true on the response - because reporting changes no output: a client that is told why its
-# reply is empty can retry, or turn the guard on.  Detection and continuation are separate for that reason.
+# The end is reported with the flag on too - one log line, totals.ended_inside_thinking (/metrics) and
+# "ended_inside_thinking": true on the response - so a client that turned the guard on is told why a reply is empty.
+# Both layers are opt-in: with the flag off a server behaves exactly as it did before #1814.
 LITERAL_THINK_RETRIES = 2
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
@@ -5232,22 +5232,20 @@ class Service:
                                   f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
-                        # #1814: this end - inside the thinking, with no answer - is reported whether or not the guard
-                        # below continues it: a client that is told why its reply is empty can act on it (retry, or
-                        # turn the guard on), the log says it, and /metrics' totals count it.  The detection changes
-                        # nothing about the reply itself, so it needs no switch.
+                        # #1814: this end - inside the thinking, with no answer - is reported only with the guard on, like the
+                        # continuation below: a client that turned the guard on is told why a reply is empty (the log line, the
+                        # total, /metrics, the response flag), and a server with the flag off behaves as before #1814.
                         inside_thinking = (thinking and finish == "stop" and not answered and not wrap and not opens
                                            and parser.state in ("reasoning", "content")
                                            and (stops is None or stops.hit is None) and not cancel.is_set())
-                        if inside_thinking:
+                        if inside_thinking and self.literal_think_guard:
                             reported_inside_thinking = True
                             self.totals["ended_inside_thinking"] = self.totals.get("ended_inside_thinking", 0) + 1
                             if trace is not None:
                                 trace["ended_inside_thinking"] = True
-                            if not (self.literal_think_guard and literal_retries < LITERAL_THINK_RETRIES):
-                                print(f"[strata] the reply ended inside its thinking with no answer ({n} tokens "
-                                      "generated): the client gets an empty reply (\"literal_think_guard\": true "
-                                      "continues it instead)", flush=True)
+                            if literal_retries >= LITERAL_THINK_RETRIES:      # the cap was reached: the guard cannot continue it
+                                print(f"[strata] the reply ended inside its thinking with no answer ({n} tokens generated) and the "
+                                      f"guard is at its cap ({LITERAL_THINK_RETRIES}): the client gets an empty reply", flush=True)
                         if self.literal_think_guard and inside_thinking \
                                 and literal_retries < LITERAL_THINK_RETRIES:
                             # #1814: the reply ended inside its thinking with no answer at all.  The model was about

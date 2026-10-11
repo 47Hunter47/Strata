@@ -97,6 +97,16 @@ class Units(unittest.TestCase):
         self.assertEqual(got[("strata:ram_total_bytes", lab)], 64 << 30)
 
 
+    def test_the_literal_think_total_is_absent_until_the_guard_reports(self):
+        """#1814: the series is absent while the flag is off (the total is never set) and present once the guard counts."""
+        m = {"engine": {"model": "m", "max_context": 1000}, "live": {}, "totals": {}}
+        lab = 'model_name="m"'
+        self.assertNotIn(("strata:totals_ended_inside_thinking_total", lab),
+                         parse(render(m, Latencies().snapshot())))
+        m["totals"]["ended_inside_thinking"] = 2
+        self.assertEqual(parse(render(m, Latencies().snapshot()))[("strata:totals_ended_inside_thinking_total", lab)], 2)
+
+
 class Endpoint(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

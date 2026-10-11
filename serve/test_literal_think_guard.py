@@ -9,13 +9,13 @@ serve/fixtures/literal_think_specimens.json holds the raw text of five real turn
 tagged with its `kind`: `no-answer` is this bug, `answered` reached its answer, `length-cut` ended on max_tokens.  This
 test replays them through a mock engine.
 
-The parser cannot tell this end from a normal one, and nothing in the token stream says "I meant it".  Two layers, so
-that the fix is not optional:
+The parser cannot tell this end from a normal one, and nothing in the token stream says "I meant it".  Both layers
+are opt-in ("literal_think_guard"), like #1053, so a server that does not turn the flag on behaves as before:
 
-  * the end is always REPORTED - one log line, `totals.ended_inside_thinking` (and /metrics), and
-    `"ended_inside_thinking": true` on the response.  This changes no output, so it has no switch.
-  * the reply is continued with the thinking closed the way #123's wrap-up closes it, which is opt-in
-    ("literal_think_guard"), like #1053: it appends the close to the prompt and spends another pass.
+  * the end is REPORTED - one log line, `totals.ended_inside_thinking` (and /metrics), and
+    `"ended_inside_thinking": true` on the response - so a client that turned the guard on is told why a reply is empty.
+  * the reply is continued with the thinking closed the way #123's wrap-up closes it: the close is appended to the
+    prompt and another pass is spent, capped per reply.
 
     python -m unittest serve.test_literal_think_guard -v
 """
@@ -94,7 +94,7 @@ def _loop_threads() -> set:
 
 
 class Guard(unittest.TestCase):
-    """#1814: on by default, capped, and it leaves a reply that produced its answer alone."""
+    """#1814: opt-in (like #1053) and capped, and it leaves a reply that produced its answer alone."""
 
     def setUp(self):
         self.tok = ByteTokenizer()
@@ -195,14 +195,23 @@ class Guard(unittest.TestCase):
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertFalse(c["message"].get("content"))
 
-    def test_the_empty_reply_says_why_it_is_empty(self):
-        """The reporting layer needs no switch: with the guard off there is still a log line, a total, and the flag."""
+    def test_off_the_reply_is_reported_nowhere(self):
+        """Both layers are opt-in: with the guard off the reply is empty, and nothing is logged, counted or returned."""
         self.close()
         self.boot(SpecimenEngine, NO_ANSWER[0]["raw"], guard_on=False)
         full = self.chat_full()
-        self.assertTrue(full["ended_inside_thinking"])
+        self.assertNotIn("ended_inside_thinking", full)
         self.assertFalse(full["choices"][0]["message"].get("content"))
-        self.assertEqual(self.svc.totals["ended_inside_thinking"], 1)
+        self.assertNotIn("ended_inside_thinking", self.svc.totals)
+
+    def test_the_capped_reply_is_reported(self):
+        """With the guard on but its cap reached, the reply is still empty and still says why (flag + total)."""
+        self.close()
+        self.boot(AlwaysStopsEngine, NO_ANSWER[0]["raw"])
+        full = self.chat_full()
+        self.assertTrue(full["ended_inside_thinking"])
+        self.assertFalse((full["choices"][0]["message"].get("content") or "").strip())
+        self.assertGreaterEqual(self.svc.totals["ended_inside_thinking"], 1)
 
     def test_the_reply_the_guard_answered_is_reported_too(self):
         full = self.chat_full()
