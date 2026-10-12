@@ -166,6 +166,15 @@ REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my 
 # "ended_inside_thinking": true on the response - so a client that turned the guard on is told why a reply is empty.
 # Both layers are opt-in: with the flag off a server behaves exactly as it did before #1814.
 LITERAL_THINK_RETRIES = 2
+# #1178 (reported by TwoAnts): the text of a stop token can never be *generated* - the literal re-tokenizes to the very
+# token that ends the turn, so a reply that was writing the marker stops before a character of it is emitted and the
+# client reads the turn as an ordinary end (the quoted `<|im_end|>` shape, #537's case for the turn-end token).  The
+# end inside the thinking is the same end seen from the other side, and closing the thinking there answers with the
+# sentence unfinished: the replies the close rescued on this box came back as stubs ("<|im_start|>", "\"", a leaked
+# plan) even though none was empty.  So the guard writes the marker's text back where the model was writing it - as
+# ordinary text (the tokenizer's `plain` spans, #931's mechanism) in the reply and in the next pass's prompt - and the
+# thought goes on from there.  Bounded per reply, like the close below.
+LITERAL_MARKER_WRITES = 2
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
 # low-effort instruction in place of the xhigh one.  Both off by default.
@@ -176,6 +185,7 @@ LOOP_COVERAGE = 0.25             # the share of the last 2,000 words inside 12-w
 LOOP_HISTORY_WORDS = 30000       # how far back the passages are counted (bounds the cost of a look)
 LOOP_TAIL_CHARS = 2048           # chars at the end of the reasoning also checked for a short period (#1753)
 LOOP_TAIL_PERIOD = 64            # a period at most this long in that tail reads as a fully repeated window
+LOOP_TEXT_MAX = 240_000          # the reasoning text kept for a look (a tail: the detector reads its last words)
 
 
 def reasoning_repeat_coverage(text):
@@ -2958,6 +2968,19 @@ def stop_strings(req: dict) -> list[str]:
     return [x for x in stop if x]
 
 
+def stop_texts(tokenizer) -> dict[int, str]:
+    """The text each stop id stands for (the reverse of `Service.stop_ids`): the write-back in `generate` needs the
+    token's own text to give it back to the reply.  The marker can never be *generated* as text - the tokenizer matches
+    the literal back to the very control token that ends the turn, so the turn stops before a character of it is
+    emitted - which is why the text has to be written back.  A stop id a config's own --eos-ids added is not here: the
+    write-back then does not fire and the turn ends as before."""
+    texts: dict[int, str] = {}
+    for text in (IM_END, "<|endoftext|>"):
+        for t in tokenizer.encode(text, parse_special=True):
+            texts.setdefault(t, text)
+    return texts
+
+
 class StopMatcher:
     """Cuts the answer's text at the first stop string.  Text that could still be the start of a stop string is held
     back (only that tail, never more), so a stop string split across tokens or chunks is still found and never sent."""
@@ -3117,6 +3140,7 @@ class Service:
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        self.stop_texts = stop_texts(tokenizer)           # #1178: each stop id's text (the write-back needs it)
         # #1814: the no-answer guard (see LITERAL_THINK_RETRIES).  Opt-in like #1053: STRATA_LITERAL_THINK_GUARD=1 or
         # "literal_think_guard": true in the model's strata-<model>.json turns it on.
         self.literal_think_guard = os.environ.get("STRATA_LITERAL_THINK_GUARD") == "1"
@@ -4138,6 +4162,7 @@ class Service:
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
         nf_retried = False                              # #879: the request was sent again after non-finite logits
         literal_retries = 0                             # #1814: continuations used by the literal-thinking-tag guard
+        literal_writes = 0                              # #1178: stop-token texts written back where the thought stopped
         reported_inside_thinking = False                # #1814: the end was reported (done/…), whatever came next
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
@@ -4274,8 +4299,12 @@ class Service:
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
-                                    if self.reasoning_loop_recovery and ev.kind == "reasoning":
-                                        reasoning_text += ev.text or ""
+                                    if ev.kind == "reasoning" and (self.reasoning_loop_recovery
+                                                                   or self.literal_think_guard):
+                                        # #728's recovery reads this, and #1178's write-back does too (its one
+                                        # exception is a thought that repeats whole passages: that is a loop running
+                                        # on, not a marker the thought mentions).  Only a tail is kept either way.
+                                        reasoning_text = (reasoning_text + (ev.text or ""))[-LOOP_TEXT_MAX:]
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
                                     yield "event", ev
@@ -4394,6 +4423,39 @@ class Service:
                             if literal_retries >= LITERAL_THINK_RETRIES:      # the cap was reached: the guard cannot continue it
                                 print(f"[strata] the reply ended inside its thinking with no answer ({n} tokens generated) and the "
                                       f"guard is at its cap ({LITERAL_THINK_RETRIES}): the client gets an empty reply", flush=True)
+                        # #1178: before the thinking is closed, the token that ended the turn gets the chance to be what
+                        # the model was writing.  Its text cannot be generated (see LITERAL_MARKER_WRITES): the reply
+                        # stops with the sentence unfinished, and the close answering for it is what produced the stubs
+                        # measured live.  Shape: the end came inside the thinking - a marker written mid-thought is a
+                        # mention, and a turn that ends on it answers nothing.  Thinking that repeats whole passages is
+                        # the exception (#728): that is a loop running on, and the close below is the tool for it.  The
+                        # written-back text is what the client sees, and as `plain` ordinary text it is the tail of the
+                        # next pass's prompt (a held </think> is the thinking closing at the turn end, not a quote).
+                        marker = self.stop_texts.get(t, "") if (self.literal_think_guard and inside_thinking
+                                                                and literal_writes < LITERAL_MARKER_WRITES) else ""
+                        if marker and parser.state == "reasoning" and not parser.pending and parser.buf != THINK_END \
+                                and reasoning_repeat_coverage(reasoning_text) < LOOP_COVERAGE:
+                            extra = self.tok.encode(marker, parse_special=True, plain=[(0, len(marker))])
+                            if max_new - n - len(extra) >= 1:
+                                literal_writes += 1
+                                with self.status_lock:
+                                    st["literal_think_writes"] = literal_writes
+                                if trace is not None:
+                                    trace["literal_think_writes"] = literal_writes
+                                print(f"[strata] the reply ended inside its thinking while writing {marker}: its text is "
+                                      "written back as ordinary text and the thinking goes on "
+                                      f"({literal_writes} of {LITERAL_MARKER_WRITES}, literal_think_guard)", flush=True)
+                                for t in extra:
+                                    n += 1
+                                    raw_ids.append(t)
+                                    thinking_n += parser.state in ("reasoning", "rcall")
+                                    evs = cut(parser.feed(detok.push(t)))
+                                    self._note(n, evs, st, rate)
+                                    for ev in evs:
+                                        yield "event", ev
+                                prompt = prompt + seg + extra
+                                finish = "length"
+                                continue
                         if self.literal_think_guard and inside_thinking \
                                 and literal_retries < LITERAL_THINK_RETRIES:
                             # #1814: the reply ended inside its thinking with no answer at all.  The model was about

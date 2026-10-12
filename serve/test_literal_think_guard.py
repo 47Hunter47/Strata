@@ -14,8 +14,12 @@ are opt-in ("literal_think_guard"), like #1053, so a server that does not turn t
 
   * the end is REPORTED - one log line, `totals.ended_inside_thinking` (and /metrics), and
     `"ended_inside_thinking": true` on the response - so a client that turned the guard on is told why a reply is empty.
-  * the reply is continued with the thinking closed the way #123's wrap-up closes it: the close is appended to the
-    prompt and another pass is spent, capped per reply.
+  * the token that ended the turn is given back as TEXT first (#1178): a stop token's text can never be generated - the
+    literal re-tokenizes to the token that stops the turn - so a thought that was writing the marker keeps it (as
+    ordinary text in the reply and in the next pass's prompt) and goes on from there.  The close below is what answers
+    when that is not the shape, and it is what a thought that repeats whole passages gets (#728's loop).
+  * otherwise the reply is continued with the thinking closed the way #123's wrap-up closes it: the close is appended to
+    the prompt and another pass is spent, capped per reply.
 
     python -m unittest serve.test_literal_think_guard -v
 """
@@ -31,7 +35,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, OutputParser, THINK_END  # noqa: E402
-from serve.server import ByteTokenizer, LITERAL_THINK_RETRIES, REASONING_CLOSE, Service, serve  # noqa: E402
+from serve.server import (LITERAL_MARKER_WRITES, LITERAL_THINK_RETRIES, REASONING_CLOSE, ByteTokenizer,  # noqa: E402
+                          Service, serve)
 from serve.test_server import CTX, ThinkingEngine  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,9 +46,13 @@ ANSWERED = [s for s in SPECIMENS if s["kind"] == "answered"]
 LENGTH_CUT = [s for s in SPECIMENS if s["kind"] == "length-cut"]
 
 
+MARKER = "<|im_end|>"
+
+
 class SpecimenEngine(ThinkingEngine):
-    """Replays one dumped turn.  A prompt that already ends with the close the guard appends gets the answer, like the
-    model continuing after the close."""
+    """Replays one dumped turn.  A prompt that ends with the guard's continuation gets the model's next pass: the close
+    it appends (#1814) is answered, and the token's own text written back (#1178) is the thought going on - it finishes
+    the sentence, closes its own thinking, and answers."""
 
     def __init__(self, tok, raw: str):
         super().__init__(tok)
@@ -52,9 +61,14 @@ class SpecimenEngine(ThinkingEngine):
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.prompts.append(list(ids))
-        done = self.tok.decode(ids).endswith(REASONING_CLOSE)
-        text = self.ANSWER if done else self.raw
-        for t in (self.tok.encode(text) + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
+        text = self.tok.decode(ids)
+        if text.endswith(REASONING_CLOSE):
+            out = self.tok.encode("\n\n" + self.ANSWER)
+        elif text.endswith(MARKER):
+            out = self.tok.encode(" is the marker the template writes." + THINK_END + "\n\n" + self.ANSWER)
+        else:
+            out = self.tok.encode(self.raw)
+        for t in (out + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
             if cancel.is_set():
                 return
             yield t
@@ -82,6 +96,23 @@ class AlwaysStopsEngine(SpecimenEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.prompts.append(list(ids))
         for t in (self.tok.encode("\n\n") + self.tok.encode("<|im_end|>", parse_special=True))[:max_new]:
+            if cancel.is_set():
+                return
+            yield t
+
+
+class LoopingThinkingEngine(SpecimenEngine):
+    """A thought that repeats one passage is #728's loop, not a marker the thought mentions: the write-back does not
+    fire on it, and the close is what continues it."""
+
+    LOOP = "loop " * 420                          # periodic and 2048+ chars: reasoning_repeat_coverage reads full coverage
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        text = self.tok.decode(ids)
+        out = self.tok.encode("\n\n" + self.ANSWER) if text.endswith(REASONING_CLOSE) \
+            else self.tok.encode(self.LOOP)
+        for t in (out + self.tok.encode(MARKER, parse_special=True))[:max_new]:
             if cancel.is_set():
                 return
             yield t
@@ -168,9 +199,10 @@ class Guard(unittest.TestCase):
         c = self.chat()
         self.assertIn(self.engine.raw[:80], c["message"]["reasoning_content"])
 
-    def test_the_continuation_gets_the_thinking_closed(self):
+    def test_the_continuation_gives_the_marker_back(self):
+        """The shape these turns died in: the text the token stood for goes back and the thought goes on from there."""
         self.chat()
-        self.assertTrue(self.tok.decode(self.engine.prompts[1]).endswith(REASONING_CLOSE))
+        self.assertTrue(self.tok.decode(self.engine.prompts[1]).endswith(MARKER))
 
     def test_a_reply_that_answered_is_not_touched(self):
         for sp in ANSWERED:
@@ -236,11 +268,44 @@ class Guard(unittest.TestCase):
         self.assertNotIn(THINK_END, c["message"]["content"])
         self.assertIn(THINK_END, c["message"]["reasoning_content"])           # the tag stayed reasoning
 
+    def test_the_marker_the_thought_was_writing_is_given_back(self):
+        """#1178: the text the stop token stood for reaches the reply as text, and the thought goes on from there."""
+        self.close()
+        self.boot(SpecimenEngine, NO_ANSWER[0]["raw"])
+        c = self.chat()
+        self.assertIn(MARKER, c["message"]["reasoning_content"])               # the reply keeps what it was writing
+        self.assertIn("is the marker the template writes", c["message"]["reasoning_content"])
+        self.assertEqual(c["message"]["content"], SpecimenEngine.ANSWER)
+        self.assertEqual(len(self.engine.prompts), 2)                          # one write-back, then the answer
+
+    def test_the_write_back_travels_as_ordinary_text(self):
+        """It goes into the next pass's prompt as `plain` text: as the control token it would stop that pass at once."""
+        self.close()
+        self.boot(SpecimenEngine, NO_ANSWER[0]["raw"])
+        self.chat()
+        special = self.tok.encode(MARKER, parse_special=True)
+        plain = self.tok.encode(MARKER, parse_special=True, plain=[(0, len(MARKER))])
+        tail = list(self.engine.prompts[1])[-len(plain):]
+        self.assertEqual(tail, plain)
+        self.assertNotIn(special[0], tail)
+
+    def test_a_looping_thought_gets_the_close_not_the_write_back(self):
+        """#728's exception: a thought that repeats whole passages is a loop running on, not a marker it mentions."""
+        self.close()
+        self.boot(LoopingThinkingEngine, "y" * 3000)     # room in the context for the loop, the close and the answer
+        c = self.chat()
+        tail = self.tok.decode(self.engine.prompts[1])
+        self.assertTrue(tail.endswith(REASONING_CLOSE))                     # the close continued it, not the text
+        self.assertFalse(tail.removesuffix(REASONING_CLOSE).endswith(MARKER))
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertEqual(c["message"]["content"], LoopingThinkingEngine.ANSWER)
+
     def test_the_retries_are_capped(self):
         self.close()
         self.boot(AlwaysStopsEngine, NO_ANSWER[0]["raw"])
         c = self.chat()
-        self.assertEqual(len(self.engine.prompts), 1 + LITERAL_THINK_RETRIES)   # the cap, not a loop
+        # the write-backs and the closes are each capped: a reply that keeps doing it cannot loop
+        self.assertEqual(len(self.engine.prompts), 1 + LITERAL_MARKER_WRITES + LITERAL_THINK_RETRIES)
         self.assertIn(c["finish_reason"], ("stop", "length"))
 
 
