@@ -144,6 +144,20 @@ class Endpoint(unittest.TestCase):
         ctype, _ = self.get("/metrics?format=prometheus", "*/*")
         self.assertTrue(ctype.startswith("text/plain"))
 
+    def test_the_literal_think_total_is_on_the_llamacpp_names_too(self):
+        """#1814: /metrics/prometheus is the llama.cpp-named renderer (Service.prometheus); the guard's total is there
+        too, and absent while the guard has not counted (a default server's /metrics carries no such series)."""
+        ctype, text = self.get("/metrics/prometheus", "*/*")
+        self.assertTrue(ctype.startswith("text/plain"))
+        self.assertNotIn("ended_inside_thinking", text)
+        self.svc.totals["ended_inside_thinking"] = 3
+        try:
+            _, text = self.get("/metrics/prometheus", "*/*")
+            self.assertIn("# TYPE strata:totals_ended_inside_thinking_total counter", text)
+            self.assertIn("strata:totals_ended_inside_thinking_total 3", text)
+        finally:
+            del self.svc.totals["ended_inside_thinking"]
+
 
 class BatchEngine(MockEngine):
     """--batch as the server sees it: several requests generate at once, none waits for the control lines."""
