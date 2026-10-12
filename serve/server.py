@@ -3763,6 +3763,10 @@ class Service:
             ("strata:drafts_accepted_total", "counter", "Speculative draft tokens accepted", t["drafts_accepted"]),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
         ]
+        if "ended_inside_thinking" in t:                 # #1814: only once the opt-in guard has counted.  This renderer
+            rows.append(("strata:totals_ended_inside_thinking_total", "counter",   # and the vLLM-named one in
+                         "Ends inside the thinking with no answer (totals.ended_inside_thinking); a reply the guard "  # serve/prometheus.py carry
+                         "continues past can count more than once", t["ended_inside_thinking"]))                    # the same series
         return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
                        for name, kind, help_, value in rows)
 

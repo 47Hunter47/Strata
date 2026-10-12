@@ -144,7 +144,8 @@ def strata(m: dict, out: list, lab: str):
     # is on.  The total is never set with the flag off, so a default server's /metrics carries no such series.
     if "ended_inside_thinking" in totals:
         metric("totals_ended_inside_thinking_total", "counter",
-               "Replies that ended inside the thinking with no answer (totals.ended_inside_thinking).",
+               "Ends inside the thinking with no answer (totals.ended_inside_thinking); a reply the guard continues "
+               "past can count more than once.",
                _num(totals.get("ended_inside_thinking")))
     last = reqs[0] if reqs else {}
     metric("last_hit_rate", "gauge", "The last request's expert cache hit rate (requests[0].hit_rate).",
