@@ -217,6 +217,9 @@ class Guard(unittest.TestCase):
         for sp in LENGTH_CUT:
             self.close()
             self.boot(SpecimenEngine, sp["raw"])
+            # 0.1.45 answer_room: thinking gets 3/4 of max_tokens and the remainder is wrapped up and answered, so
+            # this specimen would never reach its max_tokens cut.  The cap off, the turn is the one that was recorded.
+            self.svc.answer_room = False
             self.chat()
             self.assertEqual(len(self.engine.prompts), 1)                # the guard only acts on finish_reason "stop"
 
